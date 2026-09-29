@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Dobrochan Draft History — userscript для Tampermonkey, который автоматически сохраняет текст формы постинга на Dobrochan и позволяет восстановить черновики после закрытия вкладки или браузера.">
+  <title>Dobrochan Draft History</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #1f2328;
+      --muted: #59636e;
+      --border: #d0d7de;
+      --soft: #f6f8fa;
+      --link: #0969da;
+      --accent: #1f883d;
+      --accent-hover: #1a7f37;
+      --code-bg: rgba(175,184,193,.2);
+      --shadow: 0 1px 0 rgba(27,31,36,.04);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --fg: #e6edf3;
+        --muted: #9198a1;
+        --border: #30363d;
+        --soft: #161b22;
+        --link: #4493f8;
+        --accent: #238636;
+        --accent-hover: #2ea043;
+        --code-bg: rgba(110,118,129,.4);
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+
+    a { color: var(--link); }
+
+    .page {
+      width: min(900px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 64px;
+    }
+
+    .header {
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 5vw, 42px);
+      line-height: 1.15;
+      letter-spacing: -.02em;
+    }
+
+    .lead {
+      max-width: 760px;
+      margin: 14px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 7px 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--soft);
+      color: var(--fg);
+      text-decoration: none;
+      font-weight: 600;
+      box-shadow: var(--shadow);
+    }
+
+    .button:hover { filter: brightness(.98); }
+
+    .button.primary {
+      border-color: rgba(27,31,36,.15);
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .button.primary:hover { background: var(--accent-hover); }
+
+    .meta {
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    main section {
+      padding: 4px 0 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+
+    main section:last-child {
+      border-bottom: 0;
+      margin-bottom: 0;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      line-height: 1.3;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 18px;
+    }
+
+    p { margin: 0 0 12px; }
+
+    ul, ol {
+      margin: 8px 0 14px;
+      padding-left: 26px;
+    }
+
+    li + li { margin-top: 5px; }
+
+    code {
+      padding: .15em .35em;
+      border-radius: 5px;
+      background: var(--code-bg);
+      font: .9em ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+
+    .note {
+      margin: 16px 0;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--link);
+      border-radius: 6px;
+      background: var(--soft);
+    }
+
+
+    .screenshot {
+      margin: 18px 0 4px;
+    }
+
+    .screenshot img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--soft);
+    }
+
+    .screenshot figcaption {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    footer {
+      margin-top: 32px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 680px) {
+      .page { width: min(100% - 24px, 900px); padding-top: 26px; }
+      .actions { align-items: stretch; }
+      .button { justify-content: center; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <p class="eyebrow">Userscript для Tampermonkey · v0.2.0</p>
+      <h1>Dobrochan Draft History</h1>
+      <p class="lead">
+        Небольшой userscript для Tampermonkey, добавляющий локальную историю черновиков к форме постинга Dobrochan.
+      </p>
+
+      <div class="actions">
+        <a class="button primary" href="./dobrochan_draft_history_v0_2.user.js">Установить userscript</a>
+        <a class="button" href="#install">Инструкция</a>
+        <a class="button" href="#how">Как работает</a>
+      </div>
+
+      <div class="meta">
+        Требуется Tampermonkey. Скрипт работает на <code>rf.dobrochan.net/vichan/*</code>
+        и рассчитан на совместную работу с Dollchan.
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <h2>Что умеет скрипт</h2>
+        <ul>
+          <li>Сохраняет вводимый текст примерно через 2 секунды после изменений.</li>
+          <li>Немедленно сохраняет актуальный текст при скрытии или закрытии страницы.</li>
+          <li>Хранит отдельный буфер для каждой формы во вкладке, даже если в двух вкладках открыт один и тот же тред.</li>
+          <li>После перезапуска браузера пытается автоматически вернуть подходящий активный черновик в форму.</li>
+          <li>После успешной отправки помечает буфер как отправленный и начинает новый.</li>
+          <li>Различает статусы <strong>«Активный»</strong>, <strong>«Отправлен»</strong> и <strong>«Брошен»</strong>.</li>
+          <li>Показывает общую историю черновиков из разных тредов в отдельном плавающем окне.</li>
+          <li>Позволяет копировать старые тексты и вставлять их обратно в текущую форму.</li>
+          <li>Хранит несколько предыдущих версий текста, чтобы случайное массовое удаление не уничтожало единственную копию.</li>
+        </ul>
+
+        <figure class="screenshot">
+          <img src="./screenshot.png" alt="Окно истории ввода рядом с формой постинга Dobrochan">
+          <figcaption>Пример окна истории ввода рядом с формой постинга.</figcaption>
+        </figure>
+      </section>
+
+      <section id="install">
+        <h2>Установка</h2>
+        <ol>
+          <li>Установите расширение <strong>Tampermonkey</strong> в браузер.</li>
+          <li>Нажмите кнопку <strong>«Установить userscript»</strong> вверху этой страницы.</li>
+          <li>Tampermonkey откроет страницу установки скрипта.</li>
+          <li>Подтвердите установку.</li>
+          <li>Откройте или перезагрузите страницу Dobrochan.</li>
+        </ol>
+
+        <div class="note">
+          После установки рядом с элементами формы постинга появится кнопка <strong>«История ввода»</strong>.
+          Окно истории можно держать открытым рядом с формой и перемещать мышью.
+        </div>
+      </section>
+
+      <section id="how">
+        <h2>Как работает</h2>
+        <p>
+          Скрипт сохраняет черновики в локальном хранилище Tampermonkey. Вместе с текстом записываются номер доски и треда,
+          технический идентификатор буфера и время изменения. История никуда отдельно не отправляется.
+        </p>
+        <p>
+          У каждой вкладки и каждого активного буфера есть собственный идентификатор. Если браузер был закрыт
+          с незавершённым сообщением, при следующем запуске скрипт ищет подходящий активный буфер того же треда
+          и, если его удаётся однозначно сопоставить с формой, подставляет текст обратно.
+        </p>
+        <p>
+          Если сопоставление не удалось, запись не удаляется, а получает статус <strong>«Брошен»</strong> и остаётся
+          доступной через историю. После успешной отправки собственный пост определяется по поведению Dollchan и
+          помечается как <strong>«Отправлен»</strong>. Завершённые записи автоматически очищаются примерно через 180 дней,
+          активные автоматически не удаляются.
+        </p>
+      </section>
+
+      <section>
+        <h2>Совместимость и ограничения</h2>
+        <ul>
+          <li>Скрипт ориентирован на текущую форму Vichan на <code>rf.dobrochan.net</code>.</li>
+          <li>Поддерживается перемещение, скрытие и плавающий режим формы Dollchan.</li>
+          <li>Определение успешной отправки опирается на поведение Dollchan и класс собственных постов <code>.de-mypost</code>.</li>
+          <li>Если структура сайта или Dollchan существенно изменится, userscript может потребовать обновления.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      Dobrochan Draft History v0.2.0 · локальный userscript, неофициальный проект.
+    </footer>
+  </div>
+</body>
+</html>
