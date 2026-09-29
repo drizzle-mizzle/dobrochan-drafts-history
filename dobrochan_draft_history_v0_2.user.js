@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dobrochan Draft History
 // @namespace    https://rf.dobrochan.net/
-// @version      0.2.1
+// @version      0.2.2
 // @description  Автосохранение, восстановление и история текста формы постинга Dobrochan/Vichan с поддержкой Dollchan.
 // @author       Dobrochan userscript
 // @match        *://rf.dobrochan.net/vichan/*
@@ -935,7 +935,7 @@
     }
 
     function clampHistoryWindow(win) {
-        if (!win || !historyUiOpen) return;
+        if (!win || !historyUiOpen || win.classList.contains('ddh-moving')) return;
         const rect = win.getBoundingClientRect();
         const margin = 6;
         const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
@@ -993,7 +993,25 @@
     function makeHistoryDraggable(win, handle) {
         let drag = null;
 
+        const positionForPointer = (state, clientX, clientY) => {
+            const margin = 6;
+            const maxLeft = Math.max(margin, window.innerWidth - state.width - margin);
+            const maxTop = Math.max(margin, window.innerHeight - Math.min(state.height, window.innerHeight - margin * 2) - margin);
+            return {
+                left: Math.min(Math.max(clientX - state.offsetX, margin), maxLeft),
+                top: Math.min(Math.max(clientY - state.offsetY, margin), maxTop)
+            };
+        };
+
+        const renderDrag = () => {
+            if (!drag) return;
+            drag.frame = null;
+            const position = positionForPointer(drag, drag.clientX, drag.clientY);
+            win.style.transform = `translate3d(${position.left - drag.startLeft}px, ${position.top - drag.startTop}px, 0)`;
+        };
+
         handle.addEventListener('pointerdown', event => {
+            if (drag) return;
             if (event.button !== 0) return;
             if (event.target.closest('button, a, input, textarea, select, summary')) return;
 
@@ -1001,31 +1019,42 @@
             drag = {
                 pointerId: event.pointerId,
                 offsetX: event.clientX - rect.left,
-                offsetY: event.clientY - rect.top
+                offsetY: event.clientY - rect.top,
+                startLeft: rect.left,
+                startTop: rect.top,
+                width: rect.width,
+                height: rect.height,
+                clientX: event.clientX,
+                clientY: event.clientY,
+                frame: null
             };
             handle.setPointerCapture?.(event.pointerId);
             document.documentElement.classList.add('ddh-dragging');
+            win.classList.add('ddh-moving');
             event.preventDefault();
         });
 
         handle.addEventListener('pointermove', event => {
             if (!drag || event.pointerId !== drag.pointerId) return;
-            const rect = win.getBoundingClientRect();
-            const margin = 6;
-            const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
-            const maxTop = Math.max(margin, window.innerHeight - Math.min(rect.height, window.innerHeight - margin * 2) - margin);
-            const left = Math.min(Math.max(event.clientX - drag.offsetX, margin), maxLeft);
-            const top = Math.min(Math.max(event.clientY - drag.offsetY, margin), maxTop);
-            win.style.left = `${Math.round(left)}px`;
-            win.style.top = `${Math.round(top)}px`;
-            win.style.right = 'auto';
-            win.style.bottom = 'auto';
+            drag.clientX = event.clientX;
+            drag.clientY = event.clientY;
+            if (drag.frame === null) drag.frame = requestAnimationFrame(renderDrag);
         });
 
         const endDrag = event => {
             if (!drag || event.pointerId !== drag.pointerId) return;
+            if (drag.frame !== null) cancelAnimationFrame(drag.frame);
+            const clientX = event.type === 'pointercancel' ? drag.clientX : event.clientX;
+            const clientY = event.type === 'pointercancel' ? drag.clientY : event.clientY;
+            const position = positionForPointer(drag, clientX, clientY);
+            win.style.transform = '';
+            win.style.left = `${Math.round(position.left)}px`;
+            win.style.top = `${Math.round(position.top)}px`;
+            win.style.right = 'auto';
+            win.style.bottom = 'auto';
             drag = null;
             document.documentElement.classList.remove('ddh-dragging');
+            win.classList.remove('ddh-moving');
             try { handle.releasePointerCapture?.(event.pointerId); } catch { /* noop */ }
             saveHistoryPosition(win);
         };
@@ -1064,6 +1093,7 @@
                     font: 13px/1.35 Arial, sans-serif;
                 }
                 #ddh-history-window.ddh-open { display: flex !important; }
+                #ddh-history-window.ddh-moving { will-change: transform; transition: none !important; }
                 #ddh-history-window > .ddh-head {
                     flex: none;
                     display: flex !important;
