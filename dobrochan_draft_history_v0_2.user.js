@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dobrochan Draft History
 // @namespace    https://rf.dobrochan.net/
-// @version      0.2.0
+// @version      0.2.1
 // @description  Автосохранение, восстановление и история текста формы постинга Dobrochan/Vichan с поддержкой Dollchan.
 // @author       Dobrochan userscript
 // @match        *://rf.dobrochan.net/vichan/*
@@ -24,6 +24,7 @@
 
     const NS = 'ddh:v1:';
     const DRAFT_PREFIX = `${NS}draft:`;
+    const LEASE_PREFIX = `${NS}lease:`;
     const PULSE_KEY = `${NS}pulse`;
     const SESSION_TAB_KEY = `${NS}tab-id`;
     const SESSION_DRAFT_KEY = `${NS}current-draft-id`;
@@ -33,11 +34,13 @@
     const SAVE_DEBOUNCE_MS = 2000;
     const REVISION_INTERVAL_MS = 15000;
     const MAX_REVISIONS = 20;
+    const MAX_REVISION_CHARS = 100000;
+    const MAX_CLOSED_HISTORY_CHARS = 20000000;
+    const LEASE_CLEANUP_MS = 24 * 60 * 60 * 1000;
     const SUBMISSION_TIMEOUT_MS = 20000;
     const SUBMISSION_POLL_MS = 100;
     const HEARTBEAT_MS = 15000;
-    const ABANDON_AFTER_MS = 30000;
-    const ABANDON_SWEEP_DELAY_MS = 32000;
+    const OWNER_STALE_MS = 60000;
     const HISTORY_MAX_ITEMS = 500;
     const HISTORY_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 
@@ -51,7 +54,9 @@
     let textarea = null;
     let scope = null;
     let currentDraftId = null;
+    let currentClaimToken = null;
     let tabId = null;
+    const instanceId = uuid();
     let saveTimer = null;
     let heartbeatTimer = null;
     let submissionObserver = null;
@@ -61,6 +66,8 @@
     let historyUiOpen = false;
     let historyRenderTimer = null;
     let pulseListenerId = null;
+    let recoveryAmbiguous = false;
+    let recoveryRetryScheduled = false;
 
     let bc = null;
     const probeCollectors = new Map();
@@ -124,6 +131,45 @@
         return `${DRAFT_PREFIX}${id}`;
     }
 
+    function leaseKey(id) {
+        return `${LEASE_PREFIX}${id}`;
+    }
+
+    function readOwnerLease(draft) {
+        if (!draft.ownerInstanceId) return null;
+        const lease = GM_getValue(leaseKey(draft.ownerInstanceId), null);
+        return lease?.draftId === draft.id ? lease : null;
+    }
+
+    function ownerLeaseIsFresh(draft) {
+        const lease = readOwnerLease(draft);
+        return Boolean(lease && now() - lease.at < OWNER_STALE_MS);
+    }
+
+    function effectiveStatus(draft) {
+        if (draft.status !== STATUS.ACTIVE) return draft.status;
+        if (ownerLeaseIsFresh(draft)) return STATUS.ACTIVE;
+        const lastSeen = draft.heartbeatAt || draft.updatedAt || draft.createdAt || 0;
+        return now() - lastSeen >= OWNER_STALE_MS ? STATUS.ABANDONED : STATUS.ACTIVE;
+    }
+
+    function showStorageWarning(error) {
+        warn('Не удалось сохранить данные:', error);
+        if (!document.body) return;
+        let notice = document.getElementById('ddh-storage-warning');
+        if (!notice) {
+            notice = document.createElement('div');
+            notice.id = 'ddh-storage-warning';
+            notice.style.cssText = 'position:fixed;top:8px;left:8px;right:8px;z-index:10005;padding:12px;background:#a12622;color:white;border-radius:6px;font:14px Arial,sans-serif;';
+            document.body.appendChild(notice);
+        }
+        notice.textContent = 'История ввода: не удалось сохранить черновик. Скопируйте текст из формы и проверьте хранилище Tampermonkey.';
+    }
+
+    function clearStorageWarning() {
+        document.getElementById('ddh-storage-warning')?.remove();
+    }
+
     function isDraft(value) {
         return Boolean(value && typeof value === 'object' && value.id && value.version === VERSION);
     }
@@ -145,16 +191,35 @@
     }
 
     function notifyHistoryChanged(id) {
-        GM_setValue(PULSE_KEY, {
-            id: id || null,
-            at: now(),
-            tabId
-        });
+        try {
+            GM_setValue(PULSE_KEY, { id: id || null, at: now(), tabId });
+        } catch (error) {
+            warn('Не удалось уведомить другие вкладки:', error);
+        }
         scheduleHistoryRender();
     }
 
     function writeDraft(draft, pulse = true) {
-        GM_setValue(draftKey(draft.id), draft);
+        draft.revisions = Array.isArray(draft.revisions) ? draft.revisions : [];
+        if (draft.revisions.length > MAX_REVISIONS) {
+            draft.revisions.splice(0, draft.revisions.length - MAX_REVISIONS);
+        }
+        while (draft.revisions.reduce((size, revision) => size + String(revision.text || '').length, 0) > MAX_REVISION_CHARS) {
+            draft.revisions.shift();
+        }
+        if (draft.id === currentDraftId && currentClaimToken) {
+            const stored = readDraft(draft.id);
+            if (stored?.claimToken !== currentClaimToken || stored.ownerInstanceId !== instanceId) {
+                throw new Error('Вкладка больше не владеет этим черновиком');
+            }
+        }
+        try {
+            GM_setValue(draftKey(draft.id), draft);
+            clearStorageWarning();
+        } catch (error) {
+            showStorageWarning(error);
+            throw error;
+        }
         if (pulse) notifyHistoryChanged(draft.id);
         return draft;
     }
@@ -272,7 +337,7 @@
         if (changed || forceRevision) {
             writeDraft(draft, pulse);
         } else {
-            writeDraft(draft, false);
+            publishLease();
         }
         return draft;
     }
@@ -287,6 +352,8 @@
             threadUrl: scope.url,
             threadTitle: scope.title,
             ownerTabId: tabId,
+            ownerInstanceId: instanceId,
+            claimToken: uuid(),
             status: STATUS.ACTIVE,
             text: String(text ?? ''),
             revisions: [],
@@ -303,7 +370,9 @@
 
     function setCurrentDraft(draft) {
         currentDraftId = draft?.id || null;
+        currentClaimToken = draft?.claimToken || null;
         safeSessionSet(SESSION_DRAFT_KEY, currentDraftId);
+        publishLease();
         if (bc) {
             try {
                 bc.postMessage({
@@ -318,6 +387,30 @@
         }
     }
 
+    function publishLease() {
+        try {
+            if (currentDraftId) {
+                const stored = readDraft(currentDraftId);
+                if (stored?.ownerInstanceId !== instanceId || stored.claimToken !== currentClaimToken) {
+                    currentDraftId = null;
+                    currentClaimToken = null;
+                    safeSessionSet(SESSION_DRAFT_KEY, null);
+                    GM_deleteValue(leaseKey(instanceId));
+                    return;
+                }
+                GM_setValue(leaseKey(instanceId), {
+                    draftId: currentDraftId,
+                    tabId,
+                    at: now()
+                });
+            } else {
+                GM_deleteValue(leaseKey(instanceId));
+            }
+        } catch (error) {
+            warn('Не удалось обновить состояние вкладки:', error);
+        }
+    }
+
     function createActiveDraft(text, { pulse = true } = {}) {
         const draft = newDraft(text);
         writeDraft(draft, pulse);
@@ -327,7 +420,8 @@
 
     function getCurrentDraft() {
         const draft = readDraft(currentDraftId);
-        if (!draft || draft.status !== STATUS.ACTIVE || !sameScope(draft)) return null;
+        if (!draft || draft.status !== STATUS.ACTIVE || !sameScope(draft)
+            || draft.ownerInstanceId !== instanceId || draft.claimToken !== currentClaimToken) return null;
         return draft;
     }
 
@@ -384,11 +478,12 @@
                 if (!msg || typeof msg !== 'object') return;
 
                 if (msg.type === 'probe' && msg.probeId) {
-                    const advertised = currentDraftId || safeSessionGet(SESSION_DRAFT_KEY) || null;
+                    const advertised = getCurrentDraft()?.id || null;
                     bc.postMessage({
                         type: 'alive',
                         probeId: msg.probeId,
                         tabId,
+                        instanceId,
                         bufferId: advertised,
                         scopeKey: scope?.key || null
                     });
@@ -438,30 +533,37 @@
         if (navigator.locks?.request) {
             return navigator.locks.request(LOCK_NAME, { mode: 'exclusive' }, callback);
         }
-
-        // Fallback for browsers without Web Locks. The write/read verification below still
-        // makes duplicate claims unlikely, but Web Locks is the preferred path.
-        await sleep(50 + Math.floor(Math.random() * 200));
         return callback();
     }
 
     function claimDraft(draft) {
         const claimToken = uuid();
+        draft.status = STATUS.ACTIVE;
+        draft.abandonedAt = null;
         draft.ownerTabId = tabId;
+        draft.ownerInstanceId = instanceId;
         draft.claimToken = claimToken;
         draft.claimedAt = now();
         draft.heartbeatAt = now();
         writeDraft(draft, false);
+        setCurrentDraft(draft);
+        return draft;
+    }
 
-        const verify = readDraft(draft.id);
-        return verify?.claimToken === claimToken ? verify : null;
+    function scheduleRecoveryRetry() {
+        if (recoveryRetryScheduled) return;
+        recoveryRetryScheduled = true;
+        setTimeout(() => {
+            if (!textarea || textarea.value || currentDraftId || pendingSubmission) return;
+            restoreOrStart().catch(error => warn('Повторное восстановление не удалось:', error));
+        }, OWNER_STALE_MS + 1000);
     }
 
     async function claimRecoverableDraft() {
         return withClaimLock(async () => {
             const live = await collectLiveState(260);
             const drafts = loadAllDrafts()
-                .filter(d => d.status === STATUS.ACTIVE && sameScope(d))
+                .filter(d => (d.status === STATUS.ACTIVE || d.status === STATUS.ABANDONED) && sameScope(d))
                 .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
             const sessionDraftId = safeSessionGet(SESSION_DRAFT_KEY);
@@ -469,27 +571,38 @@
 
             if (sessionDraftId) {
                 const sessionDraft = drafts.find(d => d.id === sessionDraftId);
-                if (sessionDraft && (!live.bufferIds.has(sessionDraft.id) || sessionDraft.ownerTabId === tabId)) {
+                if (sessionDraft && !live.bufferIds.has(sessionDraft.id)) {
                     candidate = sessionDraft;
                 }
             }
 
             if (!candidate) {
-                if (bc) {
-                    candidate = drafts.find(d => !live.bufferIds.has(d.id)) || null;
-                } else {
-                    const t = now();
-                    candidate = drafts.find(d =>
-                        t - (d.heartbeatAt || d.updatedAt || d.createdAt || 0) >= ABANDON_AFTER_MS
-                    ) || null;
+                const available = drafts.filter(d => !live.bufferIds.has(d.id) && !ownerLeaseIsFresh(d));
+                if (available.length > 1) recoveryAmbiguous = true;
+                candidate = available.length === 1 ? available[0] : null;
+                if (!candidate && !recoveryAmbiguous
+                    && drafts.some(d => !live.bufferIds.has(d.id) && ownerLeaseIsFresh(d))) {
+                    scheduleRecoveryRetry();
                 }
             }
 
             if (!candidate) return null;
 
+            const secondProbe = await collectLiveState(350);
+            if (secondProbe.bufferIds.has(candidate.id)) return null;
+
             const currentText = textarea.value;
             if (currentText && normalizeTextForComparison(currentText) !== normalizeTextForComparison(candidate.text)) {
                 return null;
+            }
+
+            // A recent lease may belong to a delayed tab. Copy its text instead of
+            // changing a record that the other tab might still be editing.
+            if (!navigator.locks?.request || ownerLeaseIsFresh(candidate)) {
+                const copy = createActiveDraft(candidate.text);
+                copy.restoredFromId = candidate.id;
+                writeDraft(copy, false);
+                return copy;
             }
 
             return claimDraft(candidate);
@@ -515,8 +628,9 @@
             return recovered;
         }
 
-        safeSessionSet(SESSION_DRAFT_KEY, null);
-        currentDraftId = null;
+        setCurrentDraft(null);
+
+        if (recoveryAmbiguous && !textarea.value) openHistory();
 
         if (textarea.value) {
             const created = createActiveDraft(textarea.value);
@@ -527,40 +641,14 @@
         return null;
     }
 
-    async function sweepAbandonedDrafts() {
-        try {
-            await withClaimLock(async () => {
-                const live = await collectLiveState(350);
-                const t = now();
-                let changed = false;
-
-                for (const draft of loadAllDrafts()) {
-                    if (draft.status !== STATUS.ACTIVE) continue;
-                    if (draft.id === currentDraftId) continue;
-                    if (live.bufferIds.has(draft.id)) continue;
-                    if (t - (draft.heartbeatAt || draft.updatedAt || draft.createdAt || 0) < ABANDON_AFTER_MS) continue;
-
-                    draft.status = STATUS.ABANDONED;
-                    draft.abandonedAt = t;
-                    draft.ownerTabId = null;
-                    draft.claimToken = null;
-                    writeDraft(draft, false);
-                    changed = true;
-                }
-
-                if (changed) notifyHistoryChanged(null);
-            });
-        } catch (error) {
-            warn('Не удалось выполнить анализ брошенных буферов:', error);
-        }
-    }
-
     function heartbeat() {
         const draft = getCurrentDraft();
-        if (!draft || pendingSubmission) return;
-        draft.heartbeatAt = now();
-        draft.ownerTabId = tabId;
-        writeDraft(draft, false);
+        if (!draft) {
+            if (currentDraftId) setCurrentDraft(null);
+            return;
+        }
+        if (pendingSubmission) return;
+        publishLease();
     }
 
     function startHeartbeat() {
@@ -676,12 +764,18 @@
         pendingSubmission = null;
 
         const draft = readDraft(pending.draftId);
+        if (draft && (draft.ownerInstanceId !== instanceId || draft.claimToken !== currentClaimToken)) {
+            setCurrentDraft(null);
+            if (textarea.value) createActiveDraft(textarea.value);
+            return;
+        }
         if (draft) {
             draft.status = STATUS.SENT;
             draft.text = pending.submittedText;
             draft.sentAt = now();
             draft.updatedAt = draft.sentAt;
             draft.ownerTabId = null;
+            draft.ownerInstanceId = null;
             draft.heartbeatAt = null;
             draft.claimToken = null;
             delete draft.pendingSubmissionAt;
@@ -698,6 +792,8 @@
             createActiveDraft(textarea.value);
         }
 
+        cleanupHistory().catch(error => warn('Не удалось очистить историю:', error));
+
         log(`Буфер ${pending.draftId} отмечен как отправленный.`);
     }
 
@@ -710,11 +806,17 @@
 
         const draft = readDraft(pending.draftId);
         if (!draft) return;
+        if (draft.ownerInstanceId !== instanceId || draft.claimToken !== currentClaimToken) {
+            setCurrentDraft(null);
+            if (textarea.value) createActiveDraft(textarea.value);
+            return;
+        }
 
         draft.status = STATUS.ACTIVE;
         draft.ownerTabId = tabId;
+        draft.ownerInstanceId = instanceId;
         draft.heartbeatAt = now();
-        draft.claimToken = null;
+        draft.claimToken = uuid();
         delete draft.pendingSubmissionAt;
 
         // A failed submit should never erase the last known good text merely because
@@ -743,35 +845,47 @@
         writeDraft(extra, true);
     }
 
-    function cleanupHistory() {
-        const drafts = loadAllDrafts();
-        const t = now();
-        const removable = drafts.filter(d => d.status !== STATUS.ACTIVE);
-        let changed = false;
+    async function cleanupHistory() {
+        return withClaimLock(() => {
+            const drafts = loadAllDrafts();
+            const t = now();
+            const removable = drafts.filter(d => d.status !== STATUS.ACTIVE);
+            let changed = false;
+            const removedIds = new Set();
 
-        for (const draft of removable) {
-            const stamp = draft.sentAt || draft.abandonedAt || draft.updatedAt || draft.createdAt || 0;
-            if (t - stamp > HISTORY_MAX_AGE_MS) {
-                GM_deleteValue(draftKey(draft.id));
-                changed = true;
+            for (const draft of removable) {
+                const stamp = draft.sentAt || draft.abandonedAt || draft.updatedAt || draft.createdAt || 0;
+                if (t - stamp > HISTORY_MAX_AGE_MS) {
+                    if (readDraft(draft.id)?.status !== draft.status) continue;
+                    GM_deleteValue(draftKey(draft.id));
+                    removedIds.add(draft.id);
+                    changed = true;
+                }
             }
-        }
 
-        const remaining = loadAllDrafts();
-        if (remaining.length > HISTORY_MAX_ITEMS) {
+            const remaining = drafts.filter(d => !removedIds.has(d.id));
             const nonActiveOldest = remaining
                 .filter(d => d.status !== STATUS.ACTIVE)
                 .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
-            let toDelete = remaining.length - HISTORY_MAX_ITEMS;
+            let count = remaining.length;
+            let closedChars = nonActiveOldest.reduce((sum, draft) => sum + JSON.stringify(draft).length, 0);
             for (const draft of nonActiveOldest) {
-                if (toDelete <= 0) break;
+                if (count <= HISTORY_MAX_ITEMS && closedChars <= MAX_CLOSED_HISTORY_CHARS) break;
+                if (readDraft(draft.id)?.status !== draft.status) continue;
                 GM_deleteValue(draftKey(draft.id));
+                count--;
+                closedChars -= JSON.stringify(draft).length;
                 changed = true;
-                toDelete--;
             }
-        }
 
-        if (changed) notifyHistoryChanged(null);
+            for (const key of GM_listValues()) {
+                if (!key.startsWith(LEASE_PREFIX) || key === leaseKey(instanceId)) continue;
+                const lease = GM_getValue(key, null);
+                if (!lease?.at || t - lease.at > LEASE_CLEANUP_MS) GM_deleteValue(key);
+            }
+
+            if (changed) notifyHistoryChanged(null);
+        });
     }
 
     function formatTime(ts) {
@@ -1271,6 +1385,11 @@
         const ui = createHistoryUi();
         const drafts = loadAllDrafts().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
         ui.count.textContent = `${drafts.length} ${drafts.length === 1 ? 'буфер' : 'буферов'}`;
+        const active = drafts.filter(draft => draft.status === STATUS.ACTIVE);
+        if (active.length > HISTORY_MAX_ITEMS
+            || active.reduce((size, draft) => size + JSON.stringify(draft).length, 0) > MAX_CLOSED_HISTORY_CHARS) {
+            ui.count.textContent += ' · много активных черновиков, удалите ненужные';
+        }
         ui.list.replaceChildren();
 
         if (!drafts.length) {
@@ -1291,8 +1410,9 @@
             meta.className = 'meta';
 
             const badge = document.createElement('span');
-            badge.className = `badge ${draft.status}`;
-            badge.textContent = statusLabel(draft.status);
+            const status = effectiveStatus(draft);
+            badge.className = `badge ${status}`;
+            badge.textContent = statusLabel(status);
 
             const stamp = document.createElement('span');
             stamp.className = 'stamp';
@@ -1429,7 +1549,7 @@
                 applyTextToForm(text);
                 break;
             case 'delete': {
-                const ok = confirm(`Удалить буфер «${statusLabel(draft.status)}» от ${formatDate(draft.updatedAt)} ${formatTime(draft.updatedAt)}?`);
+                const ok = confirm(`Удалить буфер «${statusLabel(effectiveStatus(draft))}» от ${formatDate(draft.updatedAt)} ${formatTime(draft.updatedAt)}?`);
                 if (!ok) return;
                 if (draft.id === currentDraftId) {
                     clearTimeout(saveTimer);
@@ -1489,8 +1609,16 @@
         window.addEventListener('pagehide', () => {
             clearTimeout(saveTimer);
             saveTimer = null;
-            flushTextNow({ reason: 'pagehide' });
+            try {
+                flushTextNow({ reason: 'pagehide' });
+            } finally {
+                try { GM_deleteValue(leaseKey(instanceId)); } catch (error) { warn('Не удалось завершить сеанс вкладки:', error); }
+            }
         }, { capture: true });
+
+        window.addEventListener('pageshow', event => {
+            if (event.persisted && getCurrentDraft()) publishLease();
+        });
 
         document.addEventListener('keydown', event => {
             if (event.key === 'Escape' && historyUiOpen) closeHistory();
@@ -1547,8 +1675,7 @@
             // Optional convenience only.
         }
 
-        cleanupHistory();
-        setTimeout(sweepAbandonedDrafts, ABANDON_SWEEP_DELAY_MS);
+        await cleanupHistory();
 
         log(`Запущен для ${scope.key}; tabId=${tabId}; currentDraft=${currentDraftId || 'none'}.`);
     }
