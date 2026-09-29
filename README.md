@@ -2,7 +2,7 @@
 
 Небольшой userscript для Tampermonkey, добавляющий локальную историю черновиков к форме постинга Dobrochan.
 
-[Установить userscript](./dobrochan_draft_history_v0_2.user.js)
+### [Установить userscript](https://drizzle-mizzle.github.io/dobrochan-drafts-history/)
 
 Требуется Tampermonkey. Скрипт работает на `rf.dobrochan.net/vichan/*` и рассчитан на совместную работу с Dollchan.
 
